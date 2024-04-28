@@ -6,7 +6,7 @@ import subprocess
 directory = '/content/gaussian-splatting'
 
 # Define the URL of the new train.py
-url = 'https://raw.githubusercontent.com/paavansaireddy/3DGaussianSplatting/main/train.py'
+url = 'https://github.com/paavansaireddy/GussianSplatting/blob/main/train.py'
 
 # Check if the directory exists, if not, clone the repository
 if not os.path.exists(directory):
