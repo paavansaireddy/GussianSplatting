@@ -1,8 +1,9 @@
 
 import os
 import torch
+import torch.nn.functional as tf
 from random import randint
-from utils.loss_utils import l1_loss, ssim
+from utils.loss_utils import create_window
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -20,6 +21,40 @@ except ImportError:
     
 l_for_l = 0.0
 
+def l1_loss(ntw, gt):
+    return torch.abs((ntw - gt)).mean()
+
+def chan_for_ssim(ig1, ig2, ws=11, svg=True):
+    path = ig1.size(-3)
+    screen = create_window(ws, path)
+
+    if ig1.is_cuda:
+        screen = screen.cuda(ig1.get_device())
+    screen = screen.type_as(ig2)
+
+    return chan_for_ssim2(ig1, ig2, screen, ws, path, svg)
+
+def chan_for_ssim2(ig1, ig2, screen, ws, path, svg=True):
+    
+    x1 = tf.conv2d(ig1, screen, padding=ws // 2, groups=path)
+    x1s= x1*x1
+    x2 = tf.conv2d(ig2, screen, padding=ws // 2, groups=path)
+    x2s =x2*x2
+    x1x2 = x1 * x2
+    ss1q = tf.conv2d(ig1 * ig1, screen, padding=ws // 2, groups=path) - x1s
+    ss2q = tf.conv2d(ig2 * ig2, screen, padding=ws // 2, groups=path) - x2s
+    s12 = tf.conv2d(ig1 * ig2, screen, padding=ws // 2, groups=path) - x1x2
+
+    j1 = 0.01 ** 2
+    j2 = 0.03 ** 2
+    s_otp = ((2 * x1x2 + j1) * (2 * s12 + j2)) / ((x1s + x2s + j1) * (ss1q + ss2q + j2))
+
+    if svg:
+        return s_otp.mean()
+    else:
+        return s_otp.mean(1).mean(1).mean(1)
+
+
 def training(dataset, opt, pipe, tst_itr, svg_itr, chpt_itr, chpt, debug_from):
     global l_for_l
     # Initialize training parameters and load checkpoint if available
@@ -36,23 +71,24 @@ def training(dataset, opt, pipe, tst_itr, svg_itr, chpt_itr, chpt, debug_from):
     # Initialize time tracking for performance metrics
     startitr = torch.cuda.Event(enable_timing=True)
     enditr = torch.cuda.Event(enable_timing=True)
-    progress_bar = tqdm(range(itr1, opt.iterations), desc="Training progress")
+    flag2= opt.iterations
+    pgbr = tqdm(range(itr1, flag2), desc="Training progress")
 
     vptn_stk = None
 
     # Main training loop
     scd_itr=itr1+1
     scd_param=opt.iterations + 1
-    for iteration in range(scd_itr, scd_param):
-        handle_network_gui(iteration, gsns, pipe, bckgrd, dataset, network_gui)
+    for itr in range(scd_itr, scd_param):
+        handle_network_gui(itr, gsns, pipe, bckgrd, dataset, network_gui)
 
         startitr.record()
-        if iteration % 1000 == 0:
+        if itr % 1000 == 0:
             gsns.oneupSHdegree()
 
         viewpoint_cam = select_camera(vptn_stk, scn)
 
-        if iteration == debug_from:
+        if itr == debug_from:
             pipe.debug = True
 
         render_pkg = render(viewpoint_cam, gsns, pipe, bckgrd)
@@ -61,21 +97,21 @@ def training(dataset, opt, pipe, tst_itr, svg_itr, chpt_itr, chpt, debug_from):
         loss.backward()
         enditr.record()
         # Handle logging, checkpointing, and saving
-        manage_training_cycle(iteration, gsns, scn, loss, l_for_l, tnsr_wrtr, svg_itr, chpt_itr)
+        manage_training_cycle(itr, gsns, scn, loss, l_for_l, tnsr_wrtr, svg_itr, chpt_itr)
         l_for_l=cal_loss(loss)
         # Update progress bar display
-        update_progress_bar(progress_bar, iteration, l_for_l, opt.iterations)
+        update_progress_bar(pgbr, itr, l_for_l, opt.iterations)
 
     # Final clean-up after training loop
-    progress_bar.close()
+    pgbr.close()
     print("\nTraining complete.")
-def update_progress_bar(progress_bar, iteration, l_for_l, total_iterations):
+def update_progress_bar(pgbr, itr, l_for_l, total_iterations):
     """ Update the progress bar with the current iteration and estimated moving average loss. """
-    progress_bar.set_description(f"Training progress (iteration {iteration}/{total_iterations})")
-    progress_bar.set_postfix({"Loss": f"{l_for_l:.6f}"})
-    progress_bar.update(1)
+    pgbr.set_description(f"Training progress (iteration {itr}/{total_iterations})")
+    pgbr.set_postfix({"Loss": f"{l_for_l:.6f}"})
+    pgbr.update(1)
 
-def handle_network_gui(iteration, gsns, pipe, bckgrd, dataset, network_gui):
+def handle_network_gui(itr, gsns, pipe, bckgrd, dataset, network_gui):
     """ Manage GUI network interactions if connected. """
     if network_gui.conn is None:
         network_gui.try_connect()
@@ -83,7 +119,7 @@ def handle_network_gui(iteration, gsns, pipe, bckgrd, dataset, network_gui):
         try:
             imgn_bts = handle_custom_camera_view(gsns, pipe, bckgrd, dataset, network_gui)
             network_gui.send(imgn_bts, dataset.source_path)
-            if not keep_training_alive(iteration, opt.iterations, network_gui):
+            if not keep_training_alive(itr, opt.iterations, network_gui):
                 break
         except Exception as e:
             network_gui.conn = None
@@ -97,9 +133,9 @@ def handle_custom_camera_view(gsns, pipe, bckgrd, dataset, network_gui):
         return imgn_bts
     return None
 
-def keep_training_alive(iteration, total_iterations, network_gui):
+def keep_training_alive(itr, total_iterations, network_gui):
     """ Determine whether to continue training based on GUI input and iteration count. """
-    return network_gui.receive_training_signal() and (iteration < total_iterations or network_gui.keep_alive())
+    return network_gui.receive_training_signal() and (itr < total_iterations or network_gui.keep_alive())
 
 def select_camera(vptn_stk, scn):
     """ Select a random camera from the training set for rendering. """
@@ -111,15 +147,15 @@ def compute_loss(render_pkg, viewpoint_cam, opt):
     """ Compute the combined loss for the current iteration. """
     image, gt_image = render_pkg["render"], viewpoint_cam.original_image.cuda()
     flag1 = l1_loss(image, gt_image)
-    return (1.0 - opt.lambda_dssim) * flag1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+    return (1.0 - opt.lambda_dssim) * flag1 + opt.lambda_dssim * (1.0 - chan_for_ssim(image, gt_image))
 
-def manage_training_cycle(iteration, gsns, scn, loss, l_for_l, tnsr_wrtr, svg_itr, chpt_itr):
+def manage_training_cycle(itr, gsns, scn, loss, l_for_l, tnsr_wrtr, svg_itr, chpt_itr):
     """ Handle logging, checkpointing, and saving within the training loop. """
-    if iteration in svg_itr:
-        print("\n[ITER {}] gaussian check".format(iteration))
-        scn.save(iteration)
-    if iteration in chpt_itr:
-        print("\n[ITER {}] checkpoint check".format(iteration))
+    if itr in svg_itr:
+        print("\n[ITER {}] gaussian check".format(itr))
+        scn.save(itr)
+    if itr in chpt_itr:
+        print("\n[ITER {}] checkpoint check".format(itr))
         torch.save
 
 def cal_loss(loss):
@@ -148,20 +184,20 @@ def otp_prepare(args):
         print("Tensorboard not available: not logging progress")
     return tnsr_wrtr
 
-def training_report(tnsr_wrtr, iteration, l1_loss_value, total_loss, loss_function, elapsed, tst_itr, scn, render_func, render_args):
-    log_training_metrics(tnsr_wrtr, iteration, l1_loss_value, total_loss, elapsed)
+def training_report(tnsr_wrtr, itr, l1_loss_value, total_loss, loss_function, elapsed, tst_itr, scn, render_func, render_args):
+    log_training_metrics(tnsr_wrtr, itr, l1_loss_value, total_loss, elapsed)
 
-    if iteration in tst_itr:
-        evaluate_models(tnsr_wrtr, iteration, scn, render_func, render_args, tst_itr)
+    if itr in tst_itr:
+        evaluate_models(tnsr_wrtr, itr, scn, render_func, render_args, tst_itr)
 
-def log_training_metrics(tnsr_wrtr, iteration, l1_loss_value, total_loss, elapsed):
+def log_training_metrics(tnsr_wrtr, itr, l1_loss_value, total_loss, elapsed):
     """ Log training metrics to TensorBoard. """
     if tnsr_wrtr:
-        tnsr_wrtr.add_scalar('train_loss_patches/l1_loss', l1_loss_value.item(), iteration)
-        tnsr_wrtr.add_scalar('train_loss_patches/total_loss', total_loss.item(), iteration)
-        tnsr_wrtr.add_scalar('iter_time', elapsed, iteration)
+        tnsr_wrtr.add_scalar('train_loss_patches/l1_loss', l1_loss_value.item(), itr)
+        tnsr_wrtr.add_scalar('train_loss_patches/total_loss', total_loss.item(), itr)
+        tnsr_wrtr.add_scalar('iter_time', elapsed, itr)
 
-def evaluate_models(tnsr_wrtr, iteration, scn, render_func, render_args, tst_itr):
+def evaluate_models(tnsr_wrtr, itr, scn, render_func, render_args, tst_itr):
     """ Evaluate the model on test and training datasets, and log the results. """
     torch.cuda.empty_cache()
     validation_configs = [
@@ -170,13 +206,13 @@ def evaluate_models(tnsr_wrtr, iteration, scn, render_func, render_args, tst_itr
     ]
 
     for config in validation_configs:
-        evaluate_config(tnsr_wrtr, iteration, scn, render_func, render_args, config, tst_itr)
+        evaluate_config(tnsr_wrtr, itr, scn, render_func, render_args, config, tst_itr)
 
     if tnsr_wrtr:
-        tnsr_wrtr.add_histogram("scene/opacity_histogram", scn.gsns.get_opacity(), iteration)
-        tnsr_wrtr.add_scalar('total_points', len(scn.gsns.get_xyz()), iteration)
+        tnsr_wrtr.add_histogram("scene/opacity_histogram", scn.gsns.get_opacity(), itr)
+        tnsr_wrtr.add_scalar('total_points', len(scn.gsns.get_xyz()), itr)
 
-def evaluate_config(tnsr_wrtr, iteration, scn, render_func, render_args, config, tst_itr):
+def evaluate_config(tnsr_wrtr, itr, scn, render_func, render_args, config, tst_itr):
     """ Evaluate a specific configuration and log results. """
     if not config['cameras']:
         return
@@ -192,7 +228,7 @@ def evaluate_config(tnsr_wrtr, iteration, scn, render_func, render_args, config,
 
         # Log iamages to TensorBoard for the first few cameras
         if tnsr_wrtr and idx < 5:
-            log_images(tnsr_wrtr, iteration, config['name'], viewpoint.image_name, image, gt_image, tst_itr)
+            log_images(tnsr_wrtr, itr, config['name'], viewpoint.image_name, image, gt_image, tst_itr)
 
         # Accumulate L1 loss and PSNR values
         l1_test += l1_loss(image, gt_image).mean().item()
@@ -201,7 +237,7 @@ def evaluate_config(tnsr_wrtr, iteration, scn, render_func, render_args, config,
         # Increment the index
         idx += 1
 
-    log_evaluation_metrics(tnsr_wrtr, iteration, config['name'], l1_test, psnr_test, len(config['cameras']))
+    log_evaluation_metrics(tnsr_wrtr, itr, config['name'], l1_test, psnr_test, len(config['cameras']))
 
 def render_and_clamp_images(viewpoint, scn, render_func, render_args):
     """ Render and clamp images for evaluation. """
@@ -210,7 +246,7 @@ def render_and_clamp_images(viewpoint, scn, render_func, render_args):
     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
     return image, gt_image
 
-def log_images(tnsr_wrtr, iteration, config_name, viewpoint_name, image, gt_image, tst_itr):
+def log_images(tnsr_wrtr, itr, config_name, viewpoint_name, image, gt_image, tst_itr):
     """ Log rendered and ground truth images to TensorBoard. """
     image_log_tag = f"{config_name}_view_{viewpoint_name}/render"
 
@@ -218,19 +254,19 @@ def log_images(tnsr_wrtr, iteration, config_name, viewpoint_name, image, gt_imag
     formatted_image = image[None]  # Add a batch dimension to the image tensor
 
     # Log the image to TensorBoard
-    tnsr_wrtr.add_images(image_log_tag, formatted_image, global_step=iteration)
-    if iteration == tst_itr[0]:
+    tnsr_wrtr.add_images(image_log_tag, formatted_image, global_step=itr)
+    if itr == tst_itr[0]:
         gt_image_log_tag = f"{config_name}_view_{viewpoint_name}/ground_truth"
 # Ensure the ground truth image tensor is in the correct format (add a batch dimension if needed)
         formatted_gt_image = gt_image[None]  # Add a batch dimension to the ground truth image tensor
         # Log the ground truth image to TensorBoard
-        tnsr_wrtr.add_images(gt_image_log_tag, formatted_gt_image, global_step=iteration)
+        tnsr_wrtr.add_images(gt_image_log_tag, formatted_gt_image, global_step=itr)
 
-def log_evaluation_metrics(tnsr_wrtr, iteration, config_name, l1_test, psnr_test, num_cameras):
+def log_evaluation_metrics(tnsr_wrtr, itr, config_name, l1_test, psnr_test, num_cameras):
     """ Log evaluation metrics for a specific test configuration. """
     l1_test /= num_cameras
     psnr_test /= num_cameras
-    print(f"\n[ITER {iteration}] Evaluating {config_name}: L1 {l1_test:.6f} PSNR {psnr_test:.6f}")
+    print(f"\n[ITER {itr}] Evaluating {config_name}: L1 {l1_test:.6f} PSNR {psnr_test:.6f}")
     if tnsr_wrtr:
         # Calculate average L1 loss and PSNR over all cameras
         average_l1_loss = l1_test / num_cameras
@@ -240,8 +276,8 @@ def log_evaluation_metrics(tnsr_wrtr, iteration, config_name, l1_test, psnr_test
         l1_loss_tag = f'{config_name}/loss_viewpoint - l1_loss'
         psnr_tag = f'{config_name}/loss_viewpoint - psnr'
 
-        tnsr_wrtr.add_scalar(l1_loss_tag, average_l1_loss, iteration)
-        tnsr_wrtr.add_scalar(psnr_tag, average_psnr, iteration)
+        tnsr_wrtr.add_scalar(l1_loss_tag, average_l1_loss, itr)
+        tnsr_wrtr.add_scalar(psnr_tag, average_psnr, itr)
 
 
 def parse_arguments():
@@ -253,8 +289,8 @@ def parse_arguments():
     psr1.add_argument('--port', type=int, default=6009)
     psr1.add_argument('--debug_from', type=int, default=-1)
     psr1.add_argument('--detect_anomaly', action='store_true', default=False)
-    psr1.add_argument("--test_iterations", nargs="+", type=int, default=[500, 1000])
-    psr1.add_argument("--save_iterations", nargs="+", type=int, default=[500, 1000])
+    psr1.add_argument("--test_iterations", nargs="+", type=int, default=[7000, 30000])
+    psr1.add_argument("--save_iterations", nargs="+", type=int, default=[7000, 30000])
     psr1.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     psr1.add_argument("--start_checkpoint", type=str, default=None)
     psr1.add_argument("--quiet", action="store_true")
