@@ -21,6 +21,7 @@ except ImportError:
 l_for_l = 0.0
 
 def training(dataset, opt, pipe, tst_itr, svg_itr, chpt_itr, chpt, debug_from):
+    global l_for_l
     # Initialize training parameters and load checkpoint if available
     tnsr_wrtr = otp_prepare(dataset)
     gsns = GaussianModel(dataset.sh_degree)
@@ -59,10 +60,9 @@ def training(dataset, opt, pipe, tst_itr, svg_itr, chpt_itr, chpt, debug_from):
 
         loss.backward()
         enditr.record()
-
         # Handle logging, checkpointing, and saving
         manage_training_cycle(iteration, gsns, scn, loss, l_for_l, tnsr_wrtr, svg_itr, chpt_itr)
-
+        l_for_l=cal_loss(loss)
         # Update progress bar display
         update_progress_bar(progress_bar, iteration, l_for_l, opt.iterations)
 
@@ -115,13 +115,18 @@ def compute_loss(render_pkg, viewpoint_cam, opt):
 
 def manage_training_cycle(iteration, gsns, scn, loss, l_for_l, tnsr_wrtr, svg_itr, chpt_itr):
     """ Handle logging, checkpointing, and saving within the training loop. """
-    l_for_l = 0.4 * loss.item() + 0.6 * l_for_l
     if iteration in svg_itr:
         print("\n[ITER {}] gaussian check".format(iteration))
         scn.save(iteration)
     if iteration in chpt_itr:
         print("\n[ITER {}] checkpoint check".format(iteration))
         torch.save
+
+def cal_loss(loss):
+    global l_for_l
+    l_for_l = 0.4 * loss.item() + 0.6 * l_for_l
+    return l_for_l
+
 
 
 def otp_prepare(args):
@@ -185,7 +190,7 @@ def evaluate_config(tnsr_wrtr, iteration, scn, render_func, render_args, config,
         viewpoint = config['cameras'][idx]
         image, gt_image = render_and_clamp_images(viewpoint, scn, render_func, render_args)
 
-        # Log images to TensorBoard for the first few cameras
+        # Log iamages to TensorBoard for the first few cameras
         if tnsr_wrtr and idx < 5:
             log_images(tnsr_wrtr, iteration, config['name'], viewpoint.image_name, image, gt_image, tst_itr)
 
