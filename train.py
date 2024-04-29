@@ -17,6 +17,8 @@ try:
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
+    
+l_for_l = 0.0
 
 def training(dataset, opt, pipe, tst_itr, svg_itr, chpt_itr, chpt, debug_from):
     # Initialize training parameters and load checkpoint if available
@@ -35,7 +37,6 @@ def training(dataset, opt, pipe, tst_itr, svg_itr, chpt_itr, chpt, debug_from):
     enditr = torch.cuda.Event(enable_timing=True)
     progress_bar = tqdm(range(itr1, opt.iterations), desc="Training progress")
 
-    l_for_l = 0.0
     vptn_stk = None
 
     # Main training loop
